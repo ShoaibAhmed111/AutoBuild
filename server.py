@@ -34,6 +34,7 @@ HTML_CONTENT = """
         .badge-processing { background: #854d0e; color: #facc15; animation: pulse 1.5s infinite; }
         .badge-success { background: #14532d; color: #4ade80; }
         .badge-partial { background: #7c4a03; color: #fbbf24; }
+        .badge-guidance { background: #1e3a5f; color: #7dd3fc; }
         .badge-failed { background: #7f1d1d; color: #f87171; }
 
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
@@ -120,6 +121,7 @@ HTML_CONTENT = """
         </div>
 
         <div id="logs"></div>
+        <div id="guidance-panel" style="display:none; background:#0b1e33; border-top:2px solid #38bdf8; padding:15px 20px; max-height:220px; overflow-y:auto; font-size:13px; white-space:pre-wrap; color:#bae6fd;"></div>
         <div id="diff-container">// Git diff will appear here after task execution...</div>
         <div id="decision-panel">
             <span style="flex:1; font-size:13px; color:#cbd5e1;">Task finished. Review the diff above, then decide:</span>
@@ -142,7 +144,7 @@ HTML_CONTENT = """
         const decisionPanel = document.getElementById("decision-panel");
 
         function setStatus(state, message, progress) {
-            const cls = {success:"success", partial:"partial", failed:"failed", processing:"processing", idle:"idle"}[state] || "idle";
+            const cls = {success:"success", partial:"partial", failed:"failed", processing:"processing", idle:"idle", guidance:"guidance"}[state] || "idle";
             statusBadge.className = "badge badge-" + cls;
             statusBadge.innerText = state.toUpperCase();
             statusMsg.innerText = message;
@@ -174,6 +176,10 @@ HTML_CONTENT = """
                     logs.scrollTop = logs.scrollHeight;
                 } else if (data.type === "diff") {
                     document.getElementById("diff-container").innerText = data.text || "// No pending changes.";
+                } else if (data.type === "guidance") {
+                    const panel = document.getElementById("guidance-panel");
+                    panel.style.display = "block";
+                    panel.innerText = data.text;
                 } else if (data.type === "decision_needed") {
                     decisionPanel.style.display = "flex";
                 } else if (data.type === "approval_request") {
@@ -207,6 +213,7 @@ HTML_CONTENT = """
             const prompt = document.getElementById("promptInput").value;
             if (!prompt.trim()) return;
             decisionPanel.style.display = "none";
+            document.getElementById("guidance-panel").style.display = "none";
             ws.send(JSON.stringify({ action: "task", prompt: prompt }));
             document.getElementById("promptInput").value = "";
         }
@@ -232,6 +239,7 @@ _STATUS_TO_BADGE = {
     TaskStatus.FAILED: ("failed", "Task finished but verification failed."),
     TaskStatus.REPAIR_EXHAUSTED: ("failed", "Verification kept failing after the repair budget was exhausted."),
     TaskStatus.PLANNING_FAILED: ("failed", "The LLM could not produce a valid plan; no files were changed."),
+    TaskStatus.GUIDANCE_PROVIDED: ("guidance", "This was flagged too risky/cross-cutting to auto-apply -- instructions provided instead, no files were changed."),
 }
 
 
@@ -303,13 +311,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
         try:
             repo_map = await asyncio.to_thread(indexer.generate_repo_map)
-            report = await orchestrator.run_task(
+            report = await orchestrator.run_request(
                 user_prompt,
                 repo_map,
                 on_event=on_event,
                 on_high_impact_approval=on_high_impact_approval,
                 on_rewrite_approval=on_rewrite_approval,
             )
+
+            if report.status == TaskStatus.GUIDANCE_PROVIDED:
+                badge, message = _STATUS_TO_BADGE[TaskStatus.GUIDANCE_PROVIDED]
+                await update_status(badge, message)
+                await websocket.send_text(json.dumps({"type": "guidance", "text": report.guidance.as_text()}))
+                await log("[Guidance] No files were changed -- see the guidance panel for what to do manually.", "log-plan")
+                return
 
             if report.files_modified:
                 commit_ok, commit_msg = await asyncio.to_thread(

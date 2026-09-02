@@ -11,6 +11,7 @@ from typing import Awaitable, Callable, Optional
 from pydantic import BaseModel, Field
 
 from llm_client import UniversalLLM
+from triage import TaskTier, classify, pick_mechanical_target_file
 from verification import (
     CheckResult,
     CheckStatus,
@@ -63,8 +64,40 @@ class LedgerEvent:
 
 
 @dataclass
+class AffectedFile:
+    file: str
+    why: str
+    what_to_change: str
+
+
+@dataclass
+class GuidanceReport:
+    """Produced instead of applying changes when a request is classified as
+    too risky/cross-cutting to safely auto-apply. One LLM call, no file
+    writes, no verification loop -- this is advisory only."""
+    summary: str
+    affected_files: list = field(default_factory=list)  # list[AffectedFile]
+    steps: list = field(default_factory=list)  # list[str]
+    raw_text: str = ""
+
+    def as_text(self) -> str:
+        lines = [self.summary, ""]
+        if self.affected_files:
+            lines.append("Likely affected files:")
+            for af in self.affected_files:
+                lines.append(f"  - {af.file}: {af.why}")
+                lines.append(f"      What to change: {af.what_to_change}")
+        if self.steps:
+            lines.append("\nSuggested steps:")
+            for i, s in enumerate(self.steps, 1):
+                lines.append(f"  {i}. {s}")
+        return "\n".join(lines)
+
+
+@dataclass
 class TaskReport:
     status: TaskStatus = TaskStatus.FAILED
+    tier: str = "STANDARD"
     plan_summary: str = ""
     files_modified: list = field(default_factory=list)
     syntax_results: list = field(default_factory=list)
@@ -73,10 +106,14 @@ class TaskReport:
     command_result: Optional[VerificationResult] = None
     repair_attempts: int = 0
     ledger: list = field(default_factory=list)
+    guidance: Optional[GuidanceReport] = None
 
     def evidence_text(self) -> str:
+        if self.status == TaskStatus.GUIDANCE_PROVIDED and self.guidance:
+            return self.guidance.as_text()
         lines = [
             f"Final: {self.status.value}",
+            f"Tier: {self.tier}",
             f"Files modified: {len(self.files_modified)}",
             f"Repair attempts: {self.repair_attempts}",
         ]
@@ -393,41 +430,79 @@ Respond with ONLY this JSON schema:
         return True, ""
 
     # ------------------------------------------------------------------
-    # Unified task pipeline: Plan -> Write -> Static -> Runtime -> Command
-    # -> bounded generalized repair loop -> explicit final TaskStatus.
-    #
-    # Shared by both the CLI and the web server so verification behavior
-    # cannot drift between the two entry points.
+    # Guidance mode (GUIDANCE_ONLY tier): one advisory LLM call, no file
+    # writes, no verification loop. Used when triage.classify() decides a
+    # request is too risky/cross-cutting to safely auto-apply.
     # ------------------------------------------------------------------
-    async def run_task(
-        self,
-        user_prompt: str,
-        repo_map: str,
-        on_event: Optional[Callable[[str, str], Awaitable[None]]] = None,
-        on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
-        on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
-        allow_destructive_probe: bool = False,
-    ) -> TaskReport:
-        report = TaskReport()
+    def generate_guidance(self, user_prompt: str, repo_map: str) -> GuidanceReport:
+        registry = ContractRegistry(self.root)
+        sys_prompt = (
+            "You are a Principal Software Architect providing MIGRATION GUIDANCE, not code. "
+            "The requested change has been flagged as too risky or cross-cutting to auto-apply. "
+            "Explain precisely which files a human engineer should look at and what to change in "
+            "each, and give ordered steps. Do not write full file contents. Output strictly valid JSON."
+        )
+        prompt = f"""
+Codebase Index:
+{repo_map}
 
-        async def emit(label: str, detail: str = ""):
-            report.ledger.append(LedgerEvent(time.time(), label, detail))
-            if on_event:
-                await on_event(label, detail)
+Existing Backend API Contracts:
+{registry.as_prompt_text()}
 
-        await emit("TASK_STARTED", user_prompt)
+Feature Request (flagged HIGH RISK -- advisory only):
+"{user_prompt}"
 
+Respond with ONLY this JSON schema:
+{{
+  "summary": "One paragraph explaining the risk and overall approach",
+  "affected_files": [
+    {{"file": "app/routes/example.py", "why": "...", "what_to_change": "..."}}
+  ],
+  "steps": ["Step 1 ...", "Step 2 ..."]
+}}
+"""
         try:
-            plan = await asyncio.to_thread(self.plan, repo_map, user_prompt)
-        except PlanningFailure as e:
-            await emit("PLANNING_FAILED", str(e))
-            report.status = TaskStatus.PLANNING_FAILED
-            report.plan_summary = str(e)
-            return report
+            raw = self.llm.generate(prompt, system_prompt=sys_prompt)
+            cleaned = self._clean_raw_text(raw)
+            cleaned = self._strip_code_fence(cleaned) if "```" in cleaned else cleaned
+            start, end = cleaned.find("{"), cleaned.rfind("}")
+            data = json.loads(cleaned[start : end + 1])
+            return GuidanceReport(
+                summary=data.get("summary", ""),
+                affected_files=[
+                    AffectedFile(af.get("file", "?"), af.get("why", ""), af.get("what_to_change", ""))
+                    for af in data.get("affected_files", [])
+                ],
+                steps=data.get("steps", []),
+                raw_text=raw,
+            )
+        except Exception as e:
+            # Fail soft here (unlike planning): guidance is advisory text for
+            # a human, not code that gets executed, so a parse failure just
+            # means falling back to showing the raw LLM text rather than
+            # structured fields -- it does not risk writing anything to disk.
+            return GuidanceReport(
+                summary=f"(Could not parse structured guidance: {e}. Showing raw model output below.)",
+                raw_text=raw if "raw" in dir() else "",
+            )
 
-        report.plan_summary = plan.architectural_summary
-        await emit("PLAN_GENERATED", plan.architectural_summary)
-
+    # ------------------------------------------------------------------
+    # Shared execution core: Write -> Static -> Runtime -> Command ->
+    # bounded generalized repair loop -> explicit final TaskStatus.
+    # Used by both the STANDARD (planned, multi-file) and MECHANICAL
+    # (single pre-selected file, no planning call) tiers so verification
+    # behavior never drifts between them.
+    # ------------------------------------------------------------------
+    async def _execute_and_verify(
+        self,
+        subtasks: list[SubTask],
+        verification_command: str,
+        report: TaskReport,
+        emit: Callable[[str, str], Awaitable[None]],
+        on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]],
+        on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]],
+        allow_destructive_probe: bool,
+    ) -> TaskReport:
         async def write_with_escalation(subtask: SubTask, feedback: str = "") -> WriteOutcome:
             outcome = await asyncio.to_thread(self.write_subtask, subtask, feedback)
             if outcome.status == "needs_rewrite_approval":
@@ -441,7 +516,7 @@ Respond with ONLY this JSON schema:
                     await emit("FULL_REWRITE_APPLIED", subtask.target_file)
             return outcome
 
-        for subtask in plan.tasks:
+        for subtask in subtasks:
             if subtask.impact_level.upper() == "HIGH":
                 approved = await on_high_impact_approval(subtask) if on_high_impact_approval else True
                 if not approved:
@@ -471,7 +546,7 @@ Respond with ONLY this JSON schema:
         command_result: Optional[VerificationResult] = None
 
         def _find_subtask(target_file: str) -> SubTask:
-            for s in plan.tasks:
+            for s in subtasks:
                 if s.target_file == target_file:
                     return s
             return SubTask(target_file=target_file, requirements="Fix the reported error.", action_type="MODIFY")
@@ -531,7 +606,7 @@ Respond with ONLY this JSON schema:
 
             await emit("RUNTIME_CHECK_PASSED", f"{len(runtime_results)} route(s) probed")
 
-            command_result = await asyncio.to_thread(self.run_fixer, plan.verification_command)
+            command_result = await asyncio.to_thread(self.run_fixer, verification_command)
             report.command_result = command_result
             not_configured = command_result.summary == "Verification not configured."
             had_command_failure = (not command_result.success) and not not_configured
@@ -573,3 +648,128 @@ Respond with ONLY this JSON schema:
 
         await emit("TASK_FINISHED", report.status.value)
         return report
+
+    # ------------------------------------------------------------------
+    # STANDARD tier: full plan -> execute -> verify -> repair.
+    # ------------------------------------------------------------------
+    async def run_task(
+        self,
+        user_prompt: str,
+        repo_map: str,
+        on_event: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
+        on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
+        allow_destructive_probe: bool = False,
+    ) -> TaskReport:
+        report = TaskReport(tier=TaskTier.STANDARD.value)
+
+        async def emit(label: str, detail: str = ""):
+            report.ledger.append(LedgerEvent(time.time(), label, detail))
+            if on_event:
+                await on_event(label, detail)
+
+        await emit("TASK_STARTED", user_prompt)
+
+        try:
+            plan = await asyncio.to_thread(self.plan, repo_map, user_prompt)
+        except PlanningFailure as e:
+            await emit("PLANNING_FAILED", str(e))
+            report.status = TaskStatus.PLANNING_FAILED
+            report.plan_summary = str(e)
+            return report
+
+        report.plan_summary = plan.architectural_summary
+        await emit("PLAN_GENERATED", plan.architectural_summary)
+
+        return await self._execute_and_verify(
+            plan.tasks, plan.verification_command, report, emit,
+            on_high_impact_approval, on_rewrite_approval, allow_destructive_probe,
+        )
+
+    # ------------------------------------------------------------------
+    # MECHANICAL tier: skip multi-file planning entirely. One heuristically
+    # (or LLM-)selected target file, one write call, then the SAME
+    # verification/repair loop as STANDARD. This is the actual token/time
+    # saving lever for small, low-risk, single-file requests.
+    # ------------------------------------------------------------------
+    async def run_mechanical(
+        self,
+        user_prompt: str,
+        repo_map: str,
+        target_file: str,
+        on_event: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
+        on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
+    ) -> TaskReport:
+        report = TaskReport(tier=TaskTier.MECHANICAL.value)
+
+        async def emit(label: str, detail: str = ""):
+            report.ledger.append(LedgerEvent(time.time(), label, detail))
+            if on_event:
+                await on_event(label, detail)
+
+        await emit("TASK_STARTED", user_prompt)
+        await emit("MECHANICAL_FAST_PATH", f"Skipping multi-file planning; targeting {target_file} directly.")
+
+        subtask = SubTask(
+            step_number=1, target_file=target_file, action_type="MODIFY",
+            impact_level="LOW", requirements=user_prompt,
+        )
+        report.plan_summary = f"Mechanical single-file edit: {user_prompt}"
+
+        return await self._execute_and_verify(
+            [subtask], "none", report, emit,
+            on_high_impact_approval, on_rewrite_approval, False,
+        )
+
+    # ------------------------------------------------------------------
+    # Front door: triage -> GUIDANCE_ONLY / MECHANICAL / STANDARD.
+    # This is what callers (CLI, web server) should invoke instead of
+    # run_task() directly, so the cost-saving/safety triage actually runs.
+    # ------------------------------------------------------------------
+    async def run_request(
+        self,
+        user_prompt: str,
+        repo_map: str,
+        on_event: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
+        on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
+        allow_destructive_probe: bool = False,
+    ) -> TaskReport:
+        triage_result = classify(user_prompt)
+
+        if on_event:
+            await on_event("TRIAGE_DECISION", f"{triage_result.tier.value}: {triage_result.reason}")
+
+        if triage_result.tier == TaskTier.GUIDANCE_ONLY:
+            report = TaskReport(tier=TaskTier.GUIDANCE_ONLY.value)
+            report.ledger.append(LedgerEvent(time.time(), "TASK_STARTED", user_prompt))
+            guidance = await asyncio.to_thread(self.generate_guidance, user_prompt, repo_map)
+            report.guidance = guidance
+            report.status = TaskStatus.GUIDANCE_PROVIDED
+            report.plan_summary = guidance.summary
+            if on_event:
+                await on_event("GUIDANCE_PROVIDED", guidance.summary)
+                await on_event("TASK_FINISHED", report.status.value)
+            return report
+
+        if triage_result.tier == TaskTier.MECHANICAL:
+            target_file, pick_reason = pick_mechanical_target_file(user_prompt, repo_map)
+            if target_file is None:
+                if on_event:
+                    await on_event("MECHANICAL_FALLBACK", f"{pick_reason} Falling back to full planning (STANDARD tier).")
+                return await self.run_task(
+                    user_prompt, repo_map, on_event, on_high_impact_approval,
+                    on_rewrite_approval, allow_destructive_probe,
+                )
+            if on_event:
+                await on_event("MECHANICAL_FILE_SELECTED", f"{target_file} ({pick_reason})")
+            return await self.run_mechanical(
+                user_prompt, repo_map, target_file, on_event,
+                on_high_impact_approval, on_rewrite_approval,
+            )
+
+        return await self.run_task(
+            user_prompt, repo_map, on_event, on_high_impact_approval,
+            on_rewrite_approval, allow_destructive_probe,
+        )

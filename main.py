@@ -61,13 +61,20 @@ async def run(project_path: str, prompt: str):
             print(f"[Fatal Error] {e}")
             return
 
-        report = await orchestrator.run_task(
+        report = await orchestrator.run_request(
             prompt,
             repo_map,
             on_event=on_event,
             on_high_impact_approval=on_high_impact_approval,
             on_rewrite_approval=on_rewrite_approval,
         )
+
+        if report.status == TaskStatus.GUIDANCE_PROVIDED:
+            print(f"\n[Result] {report.status.value}")
+            print("\n[Guidance] This request was flagged too risky/cross-cutting to auto-apply. "
+                  "No files were changed. Here's what to do manually:\n")
+            print(report.evidence_text())
+            return
 
         if report.files_modified:
             commit_ok, commit_msg = sandbox.commit_changes(f"Auto Build: {prompt[:72]}")

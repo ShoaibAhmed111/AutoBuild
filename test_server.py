@@ -134,7 +134,56 @@ def test_unknown_model_key_is_rejected_not_silently_swapped():
             print("PASS: an invalid/mistyped model key is rejected with a visible error instead of silently routing to a cloud provider")
 
 
+def test_guidance_request_over_websocket_writes_no_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_project(tmp)
+
+        guidance_json = json.dumps({
+            "summary": "This requires a careful, multi-step database schema migration.",
+            "affected_files": [{"file": "app/routes/status.py", "why": "reads the current schema", "what_to_change": "add new column with a safe default first"}],
+            "steps": ["Write migration", "Deploy dual-write", "Backfill", "Cut over"],
+        })
+
+        original_init = AgentOrchestrator.__init__
+
+        def patched_init(self, project_dir):
+            original_init(self, project_dir)
+            self.llm = FakeLLM([guidance_json])
+
+        AgentOrchestrator.__init__ = patched_init
+        try:
+            client = TestClient(server.app)
+            with client.websocket_connect("/ws") as ws:
+                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b"}))
+                for _ in range(10):
+                    msg = json.loads(ws.receive_text())
+                    if msg.get("type") == "log" and "Ready" in msg.get("text", ""):
+                        break
+
+                ws.send_text(json.dumps({"action": "task", "prompt": "migrate the database schema to add a new column"}))
+
+                saw_guidance = None
+                saw_status = None
+                for _ in range(30):
+                    msg = json.loads(ws.receive_text())
+                    if msg.get("type") == "guidance":
+                        saw_guidance = msg
+                    if msg.get("type") == "status" and msg.get("state") == "guidance":
+                        saw_status = msg
+                    if saw_guidance and saw_status:
+                        break
+
+                assert saw_guidance is not None, "expected a 'guidance' message over the websocket"
+                assert "migration" in saw_guidance["text"].lower()
+                assert saw_status is not None
+                assert not (root / "app" / "routes" / "status.py").exists(), "guidance mode must never create/modify files"
+                print("PASS: a high-risk request over the websocket produces a guidance panel and touches no files")
+        finally:
+            AgentOrchestrator.__init__ = original_init
+
+
 if __name__ == "__main__":
     test_full_websocket_flow_reports_real_status_and_merges()
     test_unknown_model_key_is_rejected_not_silently_swapped()
+    test_guidance_request_over_websocket_writes_no_files()
     print("\nALL SERVER TESTS PASSED")
