@@ -10,9 +10,21 @@ from git_sandbox import GitSandbox
 from indexer import RepoIndexer
 from llm_client import UnknownModelError
 from orchestrator import AgentOrchestrator, SubTask
+from security import get_or_create_auth_token, is_path_allowed
 from verification import TaskStatus
 
 app = FastAPI()
+
+_AUTH_TOKEN, _TOKEN_WAS_GENERATED = get_or_create_auth_token()
+if _TOKEN_WAS_GENERATED:
+    print("=" * 70)
+    print("[Auto Build] No AUTOBUILD_AUTH_TOKEN set -- generated one for this session:")
+    print(f"    {_AUTH_TOKEN}")
+    print("[Auto Build] Paste this into the UI's 'Auth Token' field to connect.")
+    print("[Auto Build] Set AUTOBUILD_AUTH_TOKEN to use a fixed token across restarts.")
+    print("=" * 70)
+else:
+    print("[Auto Build] Using AUTOBUILD_AUTH_TOKEN from environment.")
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -101,6 +113,11 @@ HTML_CONTENT = """
                 <option value="openrouter_qwen">OpenRouter: Qwen 2.5 Coder 32B (cloud)</option>
                 <option value="openrouter_r1">OpenRouter: DeepSeek R1 (cloud)</option>
              </select>
+        </div>
+
+        <div>
+            <label style="font-size: 12px; color: #94a3b8; display: block; margin-bottom: 6px;">Auth Token (from server console)</label>
+            <input type="password" id="authToken" placeholder="paste the token printed at server startup" />
         </div>
 
         <div>
@@ -216,7 +233,8 @@ HTML_CONTENT = """
         function initSession() {
             const path = document.getElementById("projectPath").value;
             const model = document.getElementById("modelSelector").value;
-            ws.send(JSON.stringify({ action: "init", path: path, model: model }));
+            const authToken = document.getElementById("authToken").value;
+            ws.send(JSON.stringify({ action: "init", path: path, model: model, auth_token: authToken }));
         }
 
         function sendTask() {
@@ -267,6 +285,7 @@ async def websocket_endpoint(websocket: WebSocket):
     approval_future: asyncio.Future | None = None
     task_running = False
     task_finished_pending_decision = False
+    authenticated = False
 
     async def log(text: str, style: str = ""):
         try:
@@ -376,6 +395,17 @@ async def websocket_endpoint(websocket: WebSocket):
             data = json.loads(raw_data)
             action = data.get("action")
 
+            if not authenticated:
+                if action != "init":
+                    await log("[Error] Not authenticated. Send 'init' with a valid auth_token first.", "log-error")
+                    continue
+                provided_token = data.get("auth_token")
+                if provided_token != _AUTH_TOKEN:
+                    await log("[Error] Invalid or missing auth token. Copy the token printed in the server console into the UI.", "log-error")
+                    continue
+                authenticated = True
+                # Falls through to the normal "init" handling below.
+
             if action == "approval_response":
                 if approval_future and not approval_future.done():
                     approval_future.set_result(bool(data.get("approved", False)))
@@ -423,6 +453,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 p = Path(project_path).resolve()
+
+                path_ok, path_reason = is_path_allowed(p)
+                if not path_ok:
+                    await log(f"[Error] {path_reason}", "log-error")
+                    continue
+                if path_reason:
+                    # Allowed, but with a warning (no allowlist configured at all).
+                    await log(f"[Warning] {path_reason}", "log-error")
+
                 p.mkdir(parents=True, exist_ok=True)
 
                 sandbox = GitSandbox(str(p))

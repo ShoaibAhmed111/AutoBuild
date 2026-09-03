@@ -1,12 +1,18 @@
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+# Must be set BEFORE importing server -- see test_server.py for why.
+os.environ["AUTOBUILD_AUTH_TOKEN"] = "test-token-for-suite"
 
 from fastapi.testclient import TestClient
 
 import server
 from orchestrator import AgentOrchestrator
+
+AUTH_TOKEN = "test-token-for-suite"
 
 
 def sh(cmd, cwd):
@@ -91,7 +97,7 @@ def test_task_payload_fully_automated_skips_approval_over_websocket():
         try:
             client = TestClient(server.app)
             with client.websocket_connect("/ws") as ws:
-                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b"}))
+                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b", "auth_token": AUTH_TOKEN}))
                 for _ in range(10):
                     msg = json.loads(ws.receive_text())
                     if msg.get("type") == "log" and "Ready" in msg.get("text", ""):
@@ -150,7 +156,7 @@ def test_task_target_dir_mismatch_is_logged_not_silently_ignored():
         try:
             client = TestClient(server.app)
             with client.websocket_connect("/ws") as ws:
-                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b"}))
+                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b", "auth_token": AUTH_TOKEN}))
                 for _ in range(10):
                     msg = json.loads(ws.receive_text())
                     if msg.get("type") == "log" and "Ready" in msg.get("text", ""):

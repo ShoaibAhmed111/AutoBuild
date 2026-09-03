@@ -77,7 +77,8 @@ class PlanningFailure(Exception):
 class RouteContract:
     method: str
     path: str  # normalized, e.g. /users/{id}
-    request_fields: list = field(default_factory=list)
+    request_fields: list = field(default_factory=list)  # field NAMES (kept for backward compatibility)
+    request_field_types: dict = field(default_factory=dict)  # field name -> type annotation text (new, AST-derived)
     source_file: str = ""
 
     def path_segments(self):
@@ -109,14 +110,28 @@ def _paths_structurally_equal(contract_path: str, called_path: str) -> bool:
 
 class ContractRegistry:
     """
-    Structured backend route/schema extraction.
+    Structured backend route/schema extraction, via real AST parsing.
 
-    NOTE ON HONESTY: this is still regex-assisted text parsing, not full AST
-    resolution of FastAPI's routing semantics (it does not evaluate
-    dynamically-constructed prefixes, APIRouter objects passed around, or
-    routers mounted more than one level deep). It is accurate for the common,
-    literal case (APIRouter(prefix="..."), @router.get("...")) and reports
-    nothing beyond that -- it does not guess.
+    NOTE ON HONESTY: this is accurate for FastAPI's common literal patterns
+    (APIRouter(prefix="...") with a string literal, @router.get("...") with a
+    string literal path, include_router(module.router, prefix="...")). It
+    still cannot resolve genuinely dynamic values -- a prefix or path built
+    from a variable or f-string at runtime is not statically knowable no
+    matter how the source is parsed, AST or otherwise -- and those routes
+    are simply not added to the registry rather than guessed at.
+
+    What AST parsing fixes over the previous regex-based version:
+    - Multi-line decorators/signatures no longer break extraction (a path
+      argument spanning multiple lines, or a decorator with several keyword
+      arguments each on their own line, parses correctly).
+    - The router variable no longer has to be literally named "router" --
+      whatever name is actually assigned via `X = APIRouter(...)` in a file
+      is tracked and matched against decorators using that same name. The
+      old regex was hardcoded to the literal string "@router." and would
+      silently miss every route in a file that named its router anything
+      else (e.g. "api_router").
+    - Pydantic model field TYPES are now captured (request_field_types), not
+      just field names.
     """
 
     def __init__(self, root: Path):
@@ -124,18 +139,43 @@ class ContractRegistry:
         self.routes: list[RouteContract] = []
         self._build()
 
+    @staticmethod
+    def _extract_prefix_from_apirouter_call(call: ast.Call) -> str:
+        for kw in call.keywords:
+            if kw.arg == "prefix" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                return kw.value.value
+        return ""
+
+    @staticmethod
+    def _is_basemodel_subclass(class_def: ast.ClassDef) -> bool:
+        for base in class_def.bases:
+            if isinstance(base, ast.Name) and base.id == "BaseModel":
+                return True
+            if isinstance(base, ast.Attribute) and base.attr == "BaseModel":
+                return True
+        return False
+
     def _build(self):
         main_py = self.root / "app" / "main.py"
         routes_dir = self.root / "app" / "routes"
         mount_prefixes: dict[str, str] = {}
 
         if main_py.exists():
-            main_text = main_py.read_text(encoding="utf-8", errors="ignore")
-            for match in re.finditer(
-                r"include_router\(\s*([a-zA-Z0-9_]+)\.router(?:.*?prefix=[\"'](.*?)[\"'])?",
-                main_text,
-            ):
-                mount_prefixes[match.group(1)] = match.group(2) or ""
+            try:
+                main_tree = ast.parse(main_py.read_text(encoding="utf-8", errors="ignore"))
+                for node in ast.walk(main_tree):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "include_router"
+                        and node.args
+                        and isinstance(node.args[0], ast.Attribute)
+                        and isinstance(node.args[0].value, ast.Name)
+                    ):
+                        module_name = node.args[0].value.id
+                        mount_prefixes[module_name] = self._extract_prefix_from_apirouter_call(node)
+            except SyntaxError:
+                pass  # main.py unparsable -- proceed with no mount prefixes rather than crash
 
         if not routes_dir.exists():
             return
@@ -143,54 +183,79 @@ class ContractRegistry:
         for py_file in routes_dir.glob("*.py"):
             try:
                 content = py_file.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
+                tree = ast.parse(content)
+            except (OSError, SyntaxError):
                 continue
 
-            local_prefix_match = re.search(r"APIRouter\((?:.*prefix=[\"'](.*?)[\"'])?", content)
-            local_prefix = (
-                local_prefix_match.group(1)
-                if local_prefix_match and local_prefix_match.group(1)
-                else ""
-            )
+            router_var_names: set[str] = set()
+            local_prefix = ""
+            models: dict[str, list[tuple[str, str]]] = {}
+
+            for node in tree.body:
+                if (
+                    isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "APIRouter"
+                ):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            router_var_names.add(target.id)
+                            local_prefix = self._extract_prefix_from_apirouter_call(node.value) or local_prefix
+
+                elif isinstance(node, ast.ClassDef) and self._is_basemodel_subclass(node):
+                    fields: list[tuple[str, str]] = []
+                    for child in node.body:
+                        if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                            fields.append((child.target.id, ast.unparse(child.annotation)))
+                    models[node.name] = fields
+
+            if not router_var_names:
+                continue  # no APIRouter in this file -- nothing to register
+
             base_prefix = _normalize_path(mount_prefixes.get(py_file.stem, "") + local_prefix)
 
-            endpoints = re.findall(r"@router\.(get|post|put|delete|patch)\([\"'](.*?)[\"']", content)
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
 
-            models: dict[str, list[str]] = {}
-            for m_name, m_body in re.findall(
-                r"class\s+([A-Za-z0-9_]+)\(BaseModel\):([\s\S]*?)(?=\nclass|\n@|\Z)", content
-            ):
-                fields = [
-                    l.strip().split(":")[0].strip()
-                    for l in m_body.splitlines()
-                    if ":" in l and not l.strip().startswith("#")
-                ]
-                models[m_name] = fields
+                for dec in node.decorator_list:
+                    if not (
+                        isinstance(dec, ast.Call)
+                        and isinstance(dec.func, ast.Attribute)
+                        and isinstance(dec.func.value, ast.Name)
+                        and dec.func.value.id in router_var_names
+                        and dec.func.attr in ("get", "post", "put", "delete", "patch")
+                    ):
+                        continue
+                    if not (dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str)):
+                        continue  # dynamically-constructed path -- cannot resolve statically, don't guess
 
-            # crude but explicit: find the request-model type hint for each
-            # handler function immediately following its @router decorator,
-            # so schema attribution isn't just "the last model seen".
-            func_bodies = re.findall(
-                r"@router\.\w+\([^\n]*\)\s*\n(?:async\s+)?def\s+\w+\(([^)]*)\)", content
-            )
+                    verb = dec.func.attr
+                    raw_path = dec.args[0].value
+                    full_path = _normalize_path(f"{base_prefix}/{raw_path}")
 
-            for idx, (verb, raw_path) in enumerate(endpoints):
-                full_path = _normalize_path(f"{base_prefix}/{raw_path}")
-                request_fields: list[str] = []
-                if idx < len(func_bodies):
-                    params = func_bodies[idx]
-                    for model_name, fields_ in models.items():
-                        if re.search(rf":\s*{model_name}\b", params):
-                            request_fields = fields_
+                    request_field_names: list[str] = []
+                    request_field_types: dict[str, str] = {}
+                    for arg in node.args.args:
+                        if arg.annotation is None:
+                            continue
+                        annotation_text = ast.unparse(arg.annotation)
+                        if annotation_text in models:
+                            for fname, ftype in models[annotation_text]:
+                                request_field_names.append(fname)
+                                request_field_types[fname] = ftype
                             break
-                self.routes.append(
-                    RouteContract(
-                        method=verb.upper(),
-                        path=full_path,
-                        request_fields=request_fields,
-                        source_file=f"app/routes/{py_file.name}",
+
+                    self.routes.append(
+                        RouteContract(
+                            method=verb.upper(),
+                            path=full_path,
+                            request_fields=request_field_names,
+                            request_field_types=request_field_types,
+                            source_file=f"app/routes/{py_file.name}",
+                        )
                     )
-                )
 
     def find(self, method: str, path: str) -> Optional[RouteContract]:
         norm = _normalize_path(path)
@@ -213,7 +278,10 @@ class ContractRegistry:
             lines.append(f"  Full API Endpoints: {eps}")
             for r in routes:
                 if r.request_fields:
-                    lines.append(f"    - {r.method} {r.path} fields: [{', '.join(r.request_fields)}]")
+                    field_strs = [
+                        f"{name}: {r.request_field_types.get(name, '?')}" for name in r.request_fields
+                    ]
+                    lines.append(f"    - {r.method} {r.path} fields: [{', '.join(field_strs)}]")
         return "\n".join(lines)
 
 

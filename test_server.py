@@ -1,12 +1,20 @@
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+# Must be set BEFORE importing server, since server.py reads
+# AUTOBUILD_AUTH_TOKEN once at import time to decide between a fixed token
+# and a randomly generated one.
+os.environ["AUTOBUILD_AUTH_TOKEN"] = "test-token-for-suite"
 
 from fastapi.testclient import TestClient
 
 import server
 from orchestrator import AgentOrchestrator
+
+AUTH_TOKEN = "test-token-for-suite"
 
 
 def sh(cmd, cwd):
@@ -73,7 +81,7 @@ def test_full_websocket_flow_reports_real_status_and_merges():
         try:
             client = TestClient(server.app)
             with client.websocket_connect("/ws") as ws:
-                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b"}))
+                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b", "auth_token": AUTH_TOKEN}))
                 messages = []
                 # drain messages until we see the "Ready" log
                 for _ in range(10):
@@ -128,9 +136,14 @@ def test_unknown_model_key_is_rejected_not_silently_swapped():
         client = TestClient(server.app)
         with client.websocket_connect("/ws") as ws:
             # the OLD default was "ollama_local", which isn't a real preset key
-            ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_local"}))
-            msg = json.loads(ws.receive_text())
-            assert msg["type"] == "log" and "Unknown model key" in msg["text"], msg
+            ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_local", "auth_token": AUTH_TOKEN}))
+            saw_unknown_model_error = False
+            for _ in range(5):
+                msg = json.loads(ws.receive_text())
+                if msg.get("type") == "log" and "Unknown model key" in msg.get("text", ""):
+                    saw_unknown_model_error = True
+                    break
+            assert saw_unknown_model_error
             print("PASS: an invalid/mistyped model key is rejected with a visible error instead of silently routing to a cloud provider")
 
 
@@ -154,7 +167,7 @@ def test_guidance_request_over_websocket_writes_no_files():
         try:
             client = TestClient(server.app)
             with client.websocket_connect("/ws") as ws:
-                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b"}))
+                ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b", "auth_token": AUTH_TOKEN}))
                 for _ in range(10):
                     msg = json.loads(ws.receive_text())
                     if msg.get("type") == "log" and "Ready" in msg.get("text", ""):
@@ -182,8 +195,37 @@ def test_guidance_request_over_websocket_writes_no_files():
             AgentOrchestrator.__init__ = original_init
 
 
+def test_auth_gate_rejects_missing_or_wrong_token():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_project(tmp)
+        client = TestClient(server.app)
+
+        # No token at all on an init action -> falls through to the token
+        # comparison (None != real token) and gets the specific message.
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b"}))
+            msg = json.loads(ws.receive_text())
+            assert msg["type"] == "log" and "Invalid or missing auth token" in msg["text"], msg
+
+        # Wrong token
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"action": "init", "path": str(root), "model": "ollama_14b", "auth_token": "wrong-token"}))
+            msg = json.loads(ws.receive_text())
+            assert msg["type"] == "log" and "Invalid or missing auth token" in msg["text"], msg
+
+        # A "task" action before authentication must also be refused, not
+        # silently accepted.
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"action": "task", "prompt": "do anything"}))
+            msg = json.loads(ws.receive_text())
+            assert msg["type"] == "log" and "Not authenticated" in msg["text"], msg
+
+        print("PASS: the auth gate rejects a missing token, a wrong token, and any non-init action before authentication")
+
+
 if __name__ == "__main__":
     test_full_websocket_flow_reports_real_status_and_merges()
     test_unknown_model_key_is_rejected_not_silently_swapped()
     test_guidance_request_over_websocket_writes_no_files()
+    test_auth_gate_rejects_missing_or_wrong_token()
     print("\nALL SERVER TESTS PASSED")
