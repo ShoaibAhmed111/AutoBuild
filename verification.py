@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -443,10 +444,23 @@ except Exception as e:
     print("BOOT_FAILURE:" + str(e))
     sys.exit(1)
 """
+    # Belt-and-suspenders for "import app.main" reliability: the probe
+    # script already does sys.path.insert(0, root) internally, but that only
+    # helps once the interpreter has started. Explicitly setting cwd=root
+    # AND PYTHONPATH here means the probe resolves the target project on the
+    # import path from process start, so it doesn't depend on whatever
+    # directory server.py/main.py happened to be launched from, or on
+    # inherited environment differences between a CLI invocation and a
+    # long-running server process.
+    probe_env = os.environ.copy()
+    existing_pythonpath = probe_env.get("PYTHONPATH", "")
+    probe_env["PYTHONPATH"] = (
+        f"{root}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(root)
+    )
     try:
         res = subprocess.run(
             [sys.executable, "-c", probe_script],
-            capture_output=True, text=True, cwd=root, timeout=timeout,
+            capture_output=True, text=True, cwd=root, timeout=timeout, env=probe_env,
         )
     except Exception as e:
         # Fail CLOSED: a probe that couldn't even run is an ERROR, not a pass.

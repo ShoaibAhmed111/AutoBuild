@@ -108,6 +108,14 @@ HTML_CONTENT = """
             <input type="text" id="projectPath" placeholder="/absolute/path/to/your/project" />
         </div>
         <button onclick="initSession()">Initialize / Reset</button>
+
+        <div>
+            <label style="font-size: 12px; color: #94a3b8; display: block; margin-bottom: 6px;">Approval Mode</label>
+            <select id="modeSelector">
+                <option value="semi" selected>Semi-Automated (review HIGH-impact &amp; risky rewrites)</option>
+                <option value="full">Fully-Automated (auto-approve, no prompts)</option>
+            </select>
+        </div>
     </div>
 
     <div id="main">
@@ -142,6 +150,8 @@ HTML_CONTENT = """
         const progressBar = document.getElementById("progress-bar");
         const execBtn = document.getElementById("execBtn");
         const decisionPanel = document.getElementById("decision-panel");
+        const modeSelector = document.getElementById("modeSelector");
+        const projectPathInput = document.getElementById("projectPath");
 
         function setStatus(state, message, progress) {
             const cls = {success:"success", partial:"partial", failed:"failed", processing:"processing", idle:"idle", guidance:"guidance"}[state] || "idle";
@@ -214,7 +224,12 @@ HTML_CONTENT = """
             if (!prompt.trim()) return;
             decisionPanel.style.display = "none";
             document.getElementById("guidance-panel").style.display = "none";
-            ws.send(JSON.stringify({ action: "task", prompt: prompt }));
+            ws.send(JSON.stringify({
+                action: "task",
+                prompt: prompt,
+                target_dir: projectPathInput.value,
+                fully_automated: modeSelector.value === "full",
+            }));
             document.getElementById("promptInput").value = "";
         }
 
@@ -303,11 +318,12 @@ async def websocket_endpoint(websocket: WebSocket):
         approval_future = loop.create_future()
         return await approval_future
 
-    async def execute_task_flow(user_prompt: str):
+    async def execute_task_flow(user_prompt: str, fully_automated: bool = False):
         nonlocal task_running, task_finished_pending_decision
         task_running = True
+        mode_label = "FULLY-AUTOMATED (no approval prompts)" if fully_automated else "SEMI-AUTOMATED (approvals required)"
         await update_status("processing", "Analyzing code & planning architecture...", 10)
-        await log(f"\n[Task Received] {user_prompt}", "log-plan")
+        await log(f"\n[Task Received] {user_prompt} -- {mode_label}", "log-plan")
 
         try:
             repo_map = await asyncio.to_thread(indexer.generate_repo_map)
@@ -317,6 +333,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 on_event=on_event,
                 on_high_impact_approval=on_high_impact_approval,
                 on_rewrite_approval=on_rewrite_approval,
+                fully_automated=fully_automated,
             )
 
             if report.status == TaskStatus.GUIDANCE_PROVIDED:
@@ -441,7 +458,29 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 user_prompt = data.get("prompt")
-                asyncio.create_task(execute_task_flow(user_prompt))
+                fully_automated = bool(data.get("fully_automated", False))
+
+                # target_dir is accepted for payload-shape consistency with
+                # the UI's persisted path, but the project root is fixed at
+                # "init" time (GitSandbox/RepoIndexer/AgentOrchestrator are
+                # already scoped to it) -- silently swapping roots mid-task
+                # would be exactly the kind of silent behavior this codebase
+                # avoids elsewhere, so a mismatch is surfaced instead of acted on.
+                target_dir = data.get("target_dir")
+                if target_dir:
+                    try:
+                        requested_root = Path(target_dir).resolve()
+                        if requested_root != orchestrator.root:
+                            await log(
+                                f"[Warning] task target_dir ({requested_root}) differs from the "
+                                f"initialized project root ({orchestrator.root}); running against the "
+                                f"initialized root. Click 'Initialize / Reset' to switch projects.",
+                                "log-error",
+                            )
+                    except Exception:
+                        pass
+
+                asyncio.create_task(execute_task_flow(user_prompt, fully_automated))
                 continue
 
     except WebSocketDisconnect:

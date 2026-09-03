@@ -135,9 +135,19 @@ class TaskReport:
 
 
 class AgentOrchestrator:
-    def __init__(self, project_dir: str):
+    def __init__(self, project_dir: str, fully_automated: bool = False):
         self.root = Path(project_dir).resolve()
         self.llm = UniversalLLM()
+        # Default-safe: Semi-Automated (approvals required) unless the caller
+        # explicitly opts in. Can also be overridden per-call via
+        # run_task/run_mechanical/run_request(..., fully_automated=...)
+        # without re-instantiating the orchestrator (server.py uses this so
+        # the UI's mode toggle applies per-task rather than requiring a
+        # re-init). This ONLY affects whether HIGH-impact writes and
+        # ambiguous-patch full rewrites need a human approval callback -- it
+        # never skips syntax validation, static/runtime/command verification,
+        # or the repair loop. Verification cannot be turned off this way.
+        self.fully_automated = fully_automated
 
     # ------------------------------------------------------------------
     # Text cleanup helpers
@@ -502,12 +512,24 @@ Respond with ONLY this JSON schema:
         on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]],
         on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]],
         allow_destructive_probe: bool,
+        effective_auto: bool = False,
     ) -> TaskReport:
         async def write_with_escalation(subtask: SubTask, feedback: str = "") -> WriteOutcome:
             outcome = await asyncio.to_thread(self.write_subtask, subtask, feedback)
             if outcome.status == "needs_rewrite_approval":
                 await emit("REWRITE_APPROVAL_NEEDED", f"{subtask.target_file}: {outcome.detail}")
-                approved = await on_rewrite_approval(subtask, outcome.detail) if on_rewrite_approval else False
+                if effective_auto:
+                    # Fully-Automated: approve immediately, no callback
+                    # round-trip. This only skips the human confirmation of
+                    # an escalated full-file rewrite -- the rewrite still
+                    # goes through validate_syntax() before being written,
+                    # and the full static/runtime/command verification loop
+                    # below still runs exactly as it does in semi-automated
+                    # mode. This is "skip the popup," not "skip verification."
+                    approved = True
+                    await emit("AUTO_APPROVED", f"Full rewrite auto-approved -> {subtask.target_file}")
+                else:
+                    approved = await on_rewrite_approval(subtask, outcome.detail) if on_rewrite_approval else False
                 if not approved:
                     await emit("REWRITE_REJECTED", subtask.target_file)
                     return WriteOutcome("error", "Full rewrite required but not approved.")
@@ -518,7 +540,11 @@ Respond with ONLY this JSON schema:
 
         for subtask in subtasks:
             if subtask.impact_level.upper() == "HIGH":
-                approved = await on_high_impact_approval(subtask) if on_high_impact_approval else True
+                if effective_auto:
+                    approved = True
+                    await emit("AUTO_APPROVED", f"HIGH impact change auto-approved -> {subtask.target_file}")
+                else:
+                    approved = await on_high_impact_approval(subtask) if on_high_impact_approval else True
                 if not approved:
                     await emit("SUBTASK_SKIPPED", f"User rejected {subtask.target_file}")
                     continue
@@ -660,7 +686,14 @@ Respond with ONLY this JSON schema:
         on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
         on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
         allow_destructive_probe: bool = False,
+        fully_automated: Optional[bool] = None,
     ) -> TaskReport:
+        # None means "use the orchestrator's instance-level default"; an
+        # explicit True/False overrides it for just this call -- this is how
+        # server.py wires the UI's per-task mode toggle through without
+        # needing a fresh AgentOrchestrator per request.
+        effective_auto = self.fully_automated if fully_automated is None else fully_automated
+
         report = TaskReport(tier=TaskTier.STANDARD.value)
 
         async def emit(label: str, detail: str = ""):
@@ -684,6 +717,7 @@ Respond with ONLY this JSON schema:
         return await self._execute_and_verify(
             plan.tasks, plan.verification_command, report, emit,
             on_high_impact_approval, on_rewrite_approval, allow_destructive_probe,
+            effective_auto,
         )
 
     # ------------------------------------------------------------------
@@ -700,7 +734,10 @@ Respond with ONLY this JSON schema:
         on_event: Optional[Callable[[str, str], Awaitable[None]]] = None,
         on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
         on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
+        fully_automated: Optional[bool] = None,
     ) -> TaskReport:
+        effective_auto = self.fully_automated if fully_automated is None else fully_automated
+
         report = TaskReport(tier=TaskTier.MECHANICAL.value)
 
         async def emit(label: str, detail: str = ""):
@@ -720,6 +757,7 @@ Respond with ONLY this JSON schema:
         return await self._execute_and_verify(
             [subtask], "none", report, emit,
             on_high_impact_approval, on_rewrite_approval, False,
+            effective_auto,
         )
 
     # ------------------------------------------------------------------
@@ -735,6 +773,7 @@ Respond with ONLY this JSON schema:
         on_high_impact_approval: Optional[Callable[[SubTask], Awaitable[bool]]] = None,
         on_rewrite_approval: Optional[Callable[[SubTask, str], Awaitable[bool]]] = None,
         allow_destructive_probe: bool = False,
+        fully_automated: Optional[bool] = None,
     ) -> TaskReport:
         triage_result = classify(user_prompt)
 
@@ -742,6 +781,8 @@ Respond with ONLY this JSON schema:
             await on_event("TRIAGE_DECISION", f"{triage_result.tier.value}: {triage_result.reason}")
 
         if triage_result.tier == TaskTier.GUIDANCE_ONLY:
+            # Fully-automated mode has no effect here: guidance mode never
+            # writes files or asks for approval regardless.
             report = TaskReport(tier=TaskTier.GUIDANCE_ONLY.value)
             report.ledger.append(LedgerEvent(time.time(), "TASK_STARTED", user_prompt))
             guidance = await asyncio.to_thread(self.generate_guidance, user_prompt, repo_map)
@@ -760,16 +801,16 @@ Respond with ONLY this JSON schema:
                     await on_event("MECHANICAL_FALLBACK", f"{pick_reason} Falling back to full planning (STANDARD tier).")
                 return await self.run_task(
                     user_prompt, repo_map, on_event, on_high_impact_approval,
-                    on_rewrite_approval, allow_destructive_probe,
+                    on_rewrite_approval, allow_destructive_probe, fully_automated,
                 )
             if on_event:
                 await on_event("MECHANICAL_FILE_SELECTED", f"{target_file} ({pick_reason})")
             return await self.run_mechanical(
                 user_prompt, repo_map, target_file, on_event,
-                on_high_impact_approval, on_rewrite_approval,
+                on_high_impact_approval, on_rewrite_approval, fully_automated,
             )
 
         return await self.run_task(
             user_prompt, repo_map, on_event, on_high_impact_approval,
-            on_rewrite_approval, allow_destructive_probe,
+            on_rewrite_approval, allow_destructive_probe, fully_automated,
         )
